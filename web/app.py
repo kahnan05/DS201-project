@@ -1,21 +1,15 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import plotly.express as px
 
-# 1. Text and Titles
-st.title("My First Streamlit App")
-st.write("Welcome! Adjust the slider below to update the chart.")
+countries = {"United States": "USA", "Brazil": "BRA", "Japan": "JPN", "Australia": "AUS"}
 
-# 2. Interactive Widgets
-number = st.slider("Select number of data points", min_value=10, max_value=100, value=50)
-name = st.text_input("Enter your name", "Guest")
+name = st.selectbox("Highlight a country", list(countries))
 
-if st.button("Greet Me"):
-    st.success(f"Hello, {name}!")
+df = pd.DataFrame({"country": [countries[name]], "value": [1]})
 
-# 3. Data and Charts
-data = pd.DataFrame(
-    np.random.randn(number, 2),
-    columns=["Series A", "Series B"]
-)
-st.line_chart(data)
+fig = px.choropleth(df, locations="country", color="value",
+                    hover_name=[name], projection="cylindrical stereographic")
+fig.update_layout(coloraxis_showscale=False)
+
+st.plotly_chart(fig)

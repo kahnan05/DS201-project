@@ -119,6 +119,54 @@ COUNTRY_TOP = """
     LIMIT 10
 """
 
+# Map queries: one row per federation, columns "fed" and "value".
+# No FED_FILTER here, they cover every country at once.
+MAP_METRICS = {
+    "Mean rating": """
+        SELECT TRIM(Fed) AS fed,
+               ROUND(AVG(CAST(NOV22 AS INTEGER)), 0) AS value
+        FROM ratings
+        WHERE CAST(NOV22 AS INTEGER) > 0
+        GROUP BY TRIM(Fed)
+    """,
+    "Median rating": """
+        WITH ranked AS (
+            SELECT TRIM(Fed) AS fed,
+                   CAST(NOV22 AS INTEGER) AS rating,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY TRIM(Fed)
+                       ORDER BY CAST(NOV22 AS INTEGER)
+                   ) AS rn,
+                   COUNT(*) OVER (PARTITION BY TRIM(Fed)) AS n
+            FROM ratings
+            WHERE CAST(NOV22 AS INTEGER) > 0
+        )
+        SELECT fed, AVG(rating) AS value
+        FROM ranked
+        WHERE rn IN ((n + 1) / 2, (n + 2) / 2)
+        GROUP BY fed
+    """,
+    "Top rating": """
+        SELECT TRIM(Fed) AS fed,
+               MAX(CAST(NOV22 AS INTEGER)) AS value
+        FROM ratings
+        WHERE CAST(NOV22 AS INTEGER) > 0
+        GROUP BY TRIM(Fed)
+    """,
+    "Percent male": """
+        SELECT TRIM(Fed) AS fed,
+               ROUND(100.0 * SUM(CASE WHEN Sex = 'M' THEN 1 ELSE 0 END)
+                     / COUNT(*), 1) AS value
+        FROM ratings
+        GROUP BY TRIM(Fed)
+    """,
+    "Number of players": """
+        SELECT TRIM(Fed) AS fed, COUNT(*) AS value
+        FROM ratings
+        GROUP BY TRIM(Fed)
+    """,
+}
+
 
 @st.cache_data
 def _run_cached(sql: str, params: tuple, list_key: tuple) -> pd.DataFrame:
@@ -497,16 +545,17 @@ def handle_map_click():
 st.title("Chess Title Players")
 
 
-# Flat base color for every country that can be clicked; pass real numbers here
-# instead (e.g. {"USA": 123, ...}) to turn the map into a heat map.
-flat_values = {c: 1 for c, i in countries.items() if i["iso"] is not None}
+# Sidebar selector that only affects the heat map
+map_metric = st.sidebar.selectbox("Map shows", list(MAP_METRICS))
+
+map_df = run_query(MAP_METRICS[map_metric])
+map_values = dict(zip(map_df["fed"], map_df["value"]))
 
 st.plotly_chart(
     build_figure(
-        flat_values,
-        colorscale=FLAT_SCALE,
-        colorbar_title="Federation",
-        show_colorbar=False,
+        map_values,
+        colorscale="YlOrRd",
+        colorbar_title=map_metric,
     ),
     key="country_map",
     on_select=handle_map_click,

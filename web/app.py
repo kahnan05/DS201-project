@@ -1,10 +1,8 @@
+import json
 import streamlit as st
-import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 
-"""
-MAP PROCESSING:
-"""
+# MAP PROCESSING:
 
 countries = {
     "AFG": {"name": "Afghanistan", "iso": "AFG"},
@@ -212,64 +210,127 @@ countries = {
     "ZAM": {"name": "Zambia", "iso": "ZMB"},
     "ZIM": {"name": "Zimbabwe", "iso": "ZWE"},
 }
+
+GEOJSON_PATH = "geoBoundaries-GBR-ADM1_simplified.geojson"  # next to your app
+BASE_COLOR = "#9ecae1"
+
+# GeoJSON shapeName -> FIDE code (Northern Ireland has no FIDE federation)
+UK_NATIONS = [
+    ("England", "ENG"),
+    ("Scotland", "SCO"),
+    ("Wales", "WLS"),
+    ("Northern Ireland", None),
+]
+
 if "fide_code" not in st.session_state:
     st.session_state.fide_code = "USA"
 
+
+def _ring_area(ring):
+    # Signed area via the shoelace formula: > 0 means counter-clockwise
+    return sum(
+        ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]
+        for i in range(len(ring) - 1)
+    ) / 2
+
+
+def _rewind_polygon(rings):
+    # Plotly/d3 wants the outer ring clockwise and any holes counter-clockwise
+    fixed = []
+    for i, ring in enumerate(rings):
+        is_ccw = _ring_area(ring) > 0
+        want_ccw = i > 0  # holes CCW, outer ring CW
+        fixed.append(ring if is_ccw == want_ccw else ring[::-1])
+    return fixed
+
+
+def rewind_geojson(geojson):
+    for feature in geojson["features"]:
+        geom = feature["geometry"]
+        if geom["type"] == "Polygon":
+            geom["coordinates"] = _rewind_polygon(geom["coordinates"])
+        elif geom["type"] == "MultiPolygon":
+            geom["coordinates"] = [_rewind_polygon(p) for p in geom["coordinates"]]
+    return geojson
+
+
 @st.cache_data
 def build_figure():
-    rows, seen_iso = [], set()
-    for code, info in countries.items():
-        iso = info["iso"]
-        if iso is None or iso in seen_iso:
-            continue
-        seen_iso.add(iso)
-        rows.append({
-            "fide": code,
-            "iso": iso,
-            "name": "United Kingdom" if iso == "GBR" else info["name"],
-            "value": 1,
-        })
-    df = pd.DataFrame(rows)
+    with open(GEOJSON_PATH, encoding="utf-8") as f:
+        uk_geojson = rewind_geojson(json.load(f))
 
-    fig = px.choropleth(
-        df,
-        locations="iso",
-        color="value",
-        hover_name="name",
-        custom_data=["fide"],
-        color_continuous_scale=["#9ecae1", "#9ecae1"],  # flat base color
-        projection="cylindrical stereographic",
-    )
-    fig.update_layout(coloraxis_showscale=False, uirevision="keep")
-    fig.update_geos(uirevision="keep")
-    # Plotly highlights the clicked country itself: the selected one stays
-    # at full strength and its own color, everything else fades
-    fig.update_traces(
-        selected=dict(marker=dict(opacity=1)),
-        unselected=dict(marker=dict(opacity=0.35)),
-    )
+    flat = [[0, BASE_COLOR], [1, BASE_COLOR]]
+    selected = dict(marker=dict(opacity=1))
+    unselected = dict(marker=dict(opacity=0.35))
+
+    # World layer: everything with an ISO code except GBR (the UK is drawn below)
+    world = [
+        (code, info)
+        for code, info in countries.items()
+        if info["iso"] not in (None, "GBR")
+    ]
+    fig = go.Figure()
+    fig.add_trace(go.Choropleth(
+        locations=[info["iso"] for _, info in world],
+        z=[1] * len(world),
+        text=[info["name"] for _, info in world],
+        customdata=[[code] for code, _ in world],
+        hovertemplate="%{text}<extra></extra>",
+        colorscale=flat,
+        showscale=False,
+        selected=selected,
+        unselected=unselected,
+    ))
+
+    # UK layer: England, Scotland, Wales and Northern Ireland as separate shapes
+    fig.add_trace(go.Choropleth(
+        geojson=uk_geojson,
+        featureidkey="properties.shapeName",
+        locations=[name for name, _ in UK_NATIONS],
+        z=[1] * len(UK_NATIONS),
+        text=[name for name, _ in UK_NATIONS],
+        customdata=[[code] for _, code in UK_NATIONS],
+        hovertemplate="%{text}<extra></extra>",
+        colorscale=flat,
+        showscale=False,
+        selected=selected,
+        unselected=unselected,
+    ))
+
+    fig.update_geos(projection_type="cylindrical stereographic", uirevision="keep")
+    fig.update_layout(uirevision="keep", margin=dict(l=0, r=0, t=0, b=0))
     return fig
 
-event = st.plotly_chart(
-    build_figure(),
-    key="country_map",
-    on_select="rerun",
-    selection_mode="points",
-)
 
-# No st.rerun() needed: on_select="rerun" already reran the script
-points = event.selection["points"]
-if points:
-    st.session_state.fide_code = points[0]["customdata"][0]
+
+
+if "fide_code" not in st.session_state:
+    st.session_state.fide_code = "USA"
+
+
+def handle_map_click():
+    # Runs before the script reruns, so it can safely update the selectbox's state
+    points = st.session_state.country_map["selection"]["points"]
+    if points:
+        clicked = points[0]["customdata"][0]
+        if clicked is not None:  # ignore Northern Ireland (no FIDE code)
+            st.session_state.fide_code = clicked
+
 
 st.selectbox(
-    "Or pick from a list",
+    "Highlight a country",
     options=sorted(countries, key=lambda c: countries[c]["name"]),
     format_func=lambda code: countries[code]["name"],
     key="fide_code",
 )
 
+st.plotly_chart(
+    build_figure(),
+    key="country_map",
+    on_select=handle_map_click,
+    selection_mode="points",
+)
+
 fide_code = st.session_state.fide_code
 st.subheader(countries[fide_code]["name"])
 # fide_code is ready for your database query here
-

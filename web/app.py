@@ -364,12 +364,11 @@ countries = {
 BASE_COLOR = "#9ecae1"
 FLAT_SCALE = [[0, BASE_COLOR], [1, BASE_COLOR]]
 
-# GeoJSON shapeName -> FIDE code (Northern Ireland has no FIDE federation)
+# GeoJSON shapeName -> FIDE code 
 UK_NATIONS = [
     ("England", "ENG"),
     ("Scotland", "SCO"),
     ("Wales", "WLS"),
-    ("Northern Ireland", None),
 ]
 
 if "fide_code" not in st.session_state:
@@ -488,8 +487,7 @@ def handle_map_click():
     points = st.session_state.country_map["selection"]["points"]
     if points:
         clicked = points[0]["customdata"][0]
-        if clicked is not None:  # ignore Northern Ireland (no FIDE code)
-            st.session_state.fide_code = clicked
+        st.session_state.fide_code = clicked
 
 
 # ---------------------------------------------------------------------------
@@ -498,17 +496,6 @@ def handle_map_click():
 
 st.title("Chess Title Players")
 
-with st.sidebar.expander("Data check"):
-    st.caption(f"Using {year} / {rating_type} ratings")
-    st.dataframe(
-        run_query("SELECT Sex, COUNT(*) AS players FROM ratings GROUP BY Sex"),
-        hide_index=True,
-    )
-    st.dataframe(
-        run_query("SELECT TRIM(Tit) AS title, COUNT(*) AS players FROM ratings "
-                  "GROUP BY TRIM(Tit) ORDER BY players DESC"),
-        hide_index=True,
-    )
 
 # Flat base color for every country that can be clicked; pass real numbers here
 # instead (e.g. {"USA": 123, ...}) to turn the map into a heat map.

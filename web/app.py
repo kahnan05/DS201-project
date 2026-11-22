@@ -255,50 +255,76 @@ def rewind_geojson(geojson):
 
 
 @st.cache_data
-def build_figure():
+def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value"):
+    """values: {FIDE code: number}. Countries missing from it are drawn gray."""
+    values = values or {}
+
     with open(GEOJSON_PATH, encoding="utf-8") as f:
         uk_geojson = rewind_geojson(json.load(f))
 
-    flat = [[0, BASE_COLOR], [1, BASE_COLOR]]
     selected = dict(marker=dict(opacity=1))
     unselected = dict(marker=dict(opacity=0.35))
+    gray = [[0, "#d9d9d9"], [1, "#d9d9d9"]]
 
-    # World layer: everything with an ISO code except GBR (the UK is drawn below)
-    world = [
-        (code, info)
-        for code, info in countries.items()
-        if info["iso"] not in (None, "GBR")
+    # Two layers: world countries by ISO code, UK nations by GeoJSON name.
+    # Each layer is (location ids, display names, FIDE codes, extra kwargs)
+    world = [(c, i) for c, i in countries.items() if i["iso"] not in (None, "GBR")]
+    layers = [
+        (
+            [i["iso"] for _, i in world],
+            [i["name"] for _, i in world],
+            [c for c, _ in world],
+            {},
+        ),
+        (
+            [name for name, _ in UK_NATIONS],
+            [name for name, _ in UK_NATIONS],
+            [code for _, code in UK_NATIONS],
+            dict(geojson=uk_geojson, featureidkey="properties.shapeName"),
+        ),
     ]
-    fig = go.Figure()
-    fig.add_trace(go.Choropleth(
-        locations=[info["iso"] for _, info in world],
-        z=[1] * len(world),
-        text=[info["name"] for _, info in world],
-        customdata=[[code] for code, _ in world],
-        hovertemplate="%{text}<extra></extra>",
-        colorscale=flat,
-        showscale=False,
-        selected=selected,
-        unselected=unselected,
-    ))
 
-    # UK layer: England, Scotland, Wales and Northern Ireland as separate shapes
-    fig.add_trace(go.Choropleth(
-        geojson=uk_geojson,
-        featureidkey="properties.shapeName",
-        locations=[name for name, _ in UK_NATIONS],
-        z=[1] * len(UK_NATIONS),
-        text=[name for name, _ in UK_NATIONS],
-        customdata=[[code] for _, code in UK_NATIONS],
-        hovertemplate="%{text}<extra></extra>",
-        colorscale=flat,
-        showscale=False,
-        selected=selected,
-        unselected=unselected,
-    ))
+    fig = go.Figure()
+    for locs, names, codes, extra in layers:
+        # Split into countries with a value (heat trace) and without (gray trace)
+        has = [i for i, c in enumerate(codes) if c in values]
+        no = [i for i in range(len(codes)) if i not in has]
+
+        def pick(seq, idx):
+            return [seq[i] for i in idx]
+
+        if no:
+            fig.add_trace(go.Choropleth(
+                locations=pick(locs, no),
+                z=[1] * len(no),
+                text=pick(names, no),
+                customdata=[[codes[i]] for i in no],
+                hovertemplate="%{text}<br>No data<extra></extra>",
+                colorscale=gray,
+                showscale=False,
+                selected=selected,
+                unselected=unselected,
+                **extra,
+            ))
+        if has:
+            fig.add_trace(go.Choropleth(
+                locations=pick(locs, has),
+                z=[values[codes[i]] for i in has],
+                text=pick(names, has),
+                customdata=[[codes[i]] for i in has],
+                hovertemplate="%{text}<br>" + colorbar_title + ": %{z}<extra></extra>",
+                coloraxis="coloraxis",  # shared scale across both layers
+                selected=selected,
+                unselected=unselected,
+                **extra,
+            ))
 
     fig.update_geos(projection_type="cylindrical stereographic", uirevision="keep")
-    fig.update_layout(uirevision="keep", margin=dict(l=0, r=0, t=0, b=0))
+    fig.update_layout(
+        coloraxis=dict(colorscale=colorscale, colorbar=dict(title=colorbar_title)),
+        uirevision="keep",
+        margin=dict(l=0, r=0, t=0, b=0),
+    )
     return fig
 
 

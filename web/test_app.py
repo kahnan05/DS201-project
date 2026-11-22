@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-
 
 st.set_page_config(page_title="Chess Title Players", layout="wide")
 
-# Always find the database next to this file, no matter where Streamlit is launched
-DB_PATH = str(Path(__file__).parent / "chess_ratings.db")
+# ---------------------------------------------------------------------------
+# PATHS / DATABASE SETUP
+# ---------------------------------------------------------------------------
+
+# Always find files next to this one, no matter where Streamlit is launched
+HERE = Path(__file__).parent
+DB_PATH = str(HERE / "chess_ratings.db")
+GEOJSON_PATH = str(HERE / "geoBoundaries-GBR-ADM1_simplified.geojson")
 SOURCE_TABLE = "chess_ratings"
 
 if not Path(DB_PATH).exists():
@@ -73,11 +80,12 @@ def make_ratings_view(conn: sqlite3.Connection) -> None:
           AND CAST(rating_type AS TEXT) = '{_lit(LIST_KEY[1])}'
     """)
 
-"""
-COUNTRY QUERIES:
-FED_FILTER is swapped for "Fed IN (?, ?, ...)" so one country or several
-(for example England + Scotland + Wales) can be passed in as a list.
-"""
+
+# ---------------------------------------------------------------------------
+# COUNTRY QUERIES
+# FED_FILTER is swapped for "Fed IN (?, ?, ...)" so one country or several
+# can be passed in as a list.
+# ---------------------------------------------------------------------------
 
 COUNTRY_SUMMARY = """
     SELECT COUNT(*) AS players,
@@ -111,6 +119,7 @@ COUNTRY_TOP = """
     LIMIT 10
 """
 
+
 @st.cache_data
 def _run_cached(sql: str, params: tuple, list_key: tuple) -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
@@ -135,15 +144,15 @@ def country_query(template: str, feds: list[str], extra_filter: str = "") -> pd.
 def get_fed_codes(fide_code: str) -> list[str]:
     """Map the selected map/dropdown code to the FIDE federation codes to query.
 
-    UK HOOK (partner): the map's UK shape returns "ENG", so to treat a UK click
-    as England + Scotland + Wales, return ["ENG", "SCO", "WLS"] here.
+    England, Scotland and Wales are separate shapes on the map (each with its
+    own FIDE code), so every selection maps to exactly one federation.
     """
     return [fide_code]
 
 
-"""
-MAP PROCESSING:
-"""
+# ---------------------------------------------------------------------------
+# MAP PROCESSING
+# ---------------------------------------------------------------------------
 
 countries = {
     "AFG": {"name": "Afghanistan", "iso": "AFG"},
@@ -352,75 +361,157 @@ countries = {
     "ZIM": {"name": "Zimbabwe", "iso": "ZWE"},
 }
 
+BASE_COLOR = "#9ecae1"
+FLAT_SCALE = [[0, BASE_COLOR], [1, BASE_COLOR]]
+
+# GeoJSON shapeName -> FIDE code 
+UK_NATIONS = [
+    ("England", "ENG"),
+    ("Scotland", "SCO"),
+    ("Wales", "WLS"),
+]
+
 if "fide_code" not in st.session_state:
     st.session_state.fide_code = "USA"
 
 
-@st.cache_data
-def build_figure():
-    rows, seen_iso = [], set()
-    for code, info in countries.items():
-        iso = info["iso"]
-        if iso is None or iso in seen_iso:
-            continue
-        seen_iso.add(iso)
-        rows.append({
-            "fide": code,
-            "iso": iso,
-            "name": "United Kingdom" if iso == "GBR" else info["name"],
-            "value": 1,
-        })
-    df = pd.DataFrame(rows)
+def _ring_area(ring):
+    # Signed area via the shoelace formula: > 0 means counter-clockwise
+    return sum(
+        ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]
+        for i in range(len(ring) - 1)
+    ) / 2
 
-    fig = px.choropleth(
-        df,
-        locations="iso",
-        color="value",
-        hover_name="name",
-        custom_data=["fide"],
-        color_continuous_scale=["#9ecae1", "#9ecae1"],  # flat base color
-        projection="cylindrical stereographic",
-    )
-    fig.update_layout(coloraxis_showscale=False, uirevision="keep")
-    fig.update_geos(uirevision="keep")
-    # Plotly highlights the clicked country itself: the selected one stays
-    # at full strength and its own color, everything else fades
-    fig.update_traces(
-        selected=dict(marker=dict(opacity=1)),
-        unselected=dict(marker=dict(opacity=0.35)),
+
+def _rewind_polygon(rings):
+    # Plotly/d3 wants the outer ring clockwise and any holes counter-clockwise
+    fixed = []
+    for i, ring in enumerate(rings):
+        is_ccw = _ring_area(ring) > 0
+        want_ccw = i > 0  # holes CCW, outer ring CW
+        fixed.append(ring if is_ccw == want_ccw else ring[::-1])
+    return fixed
+
+
+def rewind_geojson(geojson):
+    for feature in geojson["features"]:
+        geom = feature["geometry"]
+        if geom["type"] == "Polygon":
+            geom["coordinates"] = _rewind_polygon(geom["coordinates"])
+        elif geom["type"] == "MultiPolygon":
+            geom["coordinates"] = [_rewind_polygon(p) for p in geom["coordinates"]]
+    return geojson
+
+
+@st.cache_data
+def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value",
+                 show_colorbar=True):
+    """values: {FIDE code: number}. Countries missing from it are drawn gray."""
+    values = values or {}
+
+    with open(GEOJSON_PATH, encoding="utf-8") as f:
+        uk_geojson = rewind_geojson(json.load(f))
+
+    selected = dict(marker=dict(opacity=1))
+    unselected = dict(marker=dict(opacity=0.35))
+    gray = [[0, "#d9d9d9"], [1, "#d9d9d9"]]
+
+    # Two layers: world countries by ISO code, UK nations by GeoJSON name.
+    # Each layer is (location ids, display names, FIDE codes, extra kwargs)
+    world = [(c, i) for c, i in countries.items() if i["iso"] not in (None, "GBR")]
+    layers = [
+        (
+            [i["iso"] for _, i in world],
+            [i["name"] for _, i in world],
+            [c for c, _ in world],
+            {},
+        ),
+        (
+            [name for name, _ in UK_NATIONS],
+            [name for name, _ in UK_NATIONS],
+            [code for _, code in UK_NATIONS],
+            dict(geojson=uk_geojson, featureidkey="properties.shapeName"),
+        ),
+    ]
+
+    fig = go.Figure()
+    for locs, names, codes, extra in layers:
+        # Split into countries with a value (heat trace) and without (gray trace)
+        has = [i for i, c in enumerate(codes) if c in values]
+        no = [i for i in range(len(codes)) if i not in has]
+
+        def pick(seq, idx):
+            return [seq[i] for i in idx]
+
+        if no:
+            fig.add_trace(go.Choropleth(
+                locations=pick(locs, no),
+                z=[1] * len(no),
+                text=pick(names, no),
+                customdata=[[codes[i]] for i in no],
+                hovertemplate="%{text}<br>No data<extra></extra>",
+                colorscale=gray,
+                showscale=False,
+                selected=selected,
+                unselected=unselected,
+                **extra,
+            ))
+        if has:
+            fig.add_trace(go.Choropleth(
+                locations=pick(locs, has),
+                z=[values[codes[i]] for i in has],
+                text=pick(names, has),
+                customdata=[[codes[i]] for i in has],
+                hovertemplate="%{text}<br>" + colorbar_title + ": %{z}<extra></extra>",
+                coloraxis="coloraxis",  # shared scale across both layers
+                selected=selected,
+                unselected=unselected,
+                **extra,
+            ))
+
+    fig.update_geos(projection_type="cylindrical stereographic", uirevision="keep")
+    fig.update_layout(
+        coloraxis=dict(
+            colorscale=colorscale,
+            colorbar=dict(title=colorbar_title),
+            showscale=show_colorbar,
+        ),
+        uirevision="keep",
+        margin=dict(l=0, r=0, t=0, b=0),
     )
     return fig
 
 
-"""
-PAGE:
-"""
+def handle_map_click():
+    # Runs before the script reruns, so it can safely update the selectbox's state
+    points = st.session_state.country_map["selection"]["points"]
+    if points:
+        clicked = points[0]["customdata"][0]
+        st.session_state.fide_code = clicked
+
+
+# ---------------------------------------------------------------------------
+# PAGE
+# ---------------------------------------------------------------------------
 
 st.title("Chess Title Players")
 
-with st.sidebar.expander("Data check"):
-    st.caption(f"Using {year} / {rating_type} ratings")
-    st.dataframe(
-        run_query("SELECT Sex, COUNT(*) AS players FROM ratings GROUP BY Sex"),
-        hide_index=True,
-    )
-    st.dataframe(
-        run_query("SELECT TRIM(Tit) AS title, COUNT(*) AS players FROM ratings "
-                  "GROUP BY TRIM(Tit) ORDER BY players DESC"),
-        hide_index=True,
-    )
 
-event = st.plotly_chart(
-    build_figure(),
+# Flat base color for every country that can be clicked; pass real numbers here
+# instead (e.g. {"USA": 123, ...}) to turn the map into a heat map.
+flat_values = {c: 1 for c, i in countries.items() if i["iso"] is not None}
+
+st.plotly_chart(
+    build_figure(
+        flat_values,
+        colorscale=FLAT_SCALE,
+        colorbar_title="Federation",
+        show_colorbar=False,
+    ),
     key="country_map",
-    on_select="rerun",
+    on_select=handle_map_click,
     selection_mode="points",
 )
-
-# No st.rerun() needed: on_select="rerun" already reran the script
-points = event.selection["points"]
-if points:
-    st.session_state.fide_code = points[0]["customdata"][0]
 
 st.selectbox(
     "Or pick from a list",
@@ -470,3 +561,150 @@ else:
             country_query(COUNTRY_TOP, feds, extra_filter="AND Sex = 'F'"),
             hide_index=True,
         )
+
+# ---------------------------------------------------------------------------
+# PLAYER RATING HISTORY
+# ---------------------------------------------------------------------------
+
+HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the chart
+
+
+@st.cache_data
+def _run_raw(sql: str, params: tuple = ()) -> pd.DataFrame:
+    """Query the real table directly (the 'ratings' view only holds one year)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+
+
+def search_players(text: str, rtype: str) -> pd.DataFrame:
+    terms = text.split()
+    where = " AND ".join("name LIKE ?" for _ in terms)
+    sql = f"""
+        SELECT player_id, name, federation, MAX(year) AS last_year
+        FROM {SOURCE_TABLE}
+        WHERE CAST(rating_type AS TEXT) = ? AND {where}
+        GROUP BY player_id
+        ORDER BY last_year DESC, name
+        LIMIT 25
+    """
+    return _run_raw(sql, (rtype, *[f"%{t}%" for t in terms]))
+
+
+def rating_history(player_id, rtype: str) -> pd.DataFrame:
+    sql = f"""
+        SELECT CAST(year AS INTEGER) AS year,
+               MAX(CAST(rating AS INTEGER)) AS rating
+        FROM {SOURCE_TABLE}
+        WHERE player_id = ? AND CAST(rating_type AS TEXT) = ?
+          AND CAST(rating AS INTEGER) > 0
+        GROUP BY year
+        ORDER BY year
+    """
+    return _run_raw(sql, (player_id, rtype))
+
+
+st.divider()
+st.header("Player rating history")
+
+search_text = st.text_input("Search for a player")
+
+words = search_text.split()
+if len(words) < 2:
+    st.info("Enter a player's first and last name.")
+else:
+    matches = search_players(search_text.strip(), str(rating_type))
+
+    if matches.empty:
+        st.warning("No players found with that name.")
+    else:
+        # Prefer an exact name match (same words, any order, commas ignored)
+        wanted = sorted(w.lower().strip(",") for w in words)
+        exact = matches[matches["name"].apply(
+            lambda n: sorted(str(n).lower().replace(",", " ").split()) == wanted
+        )]
+
+        if len(exact) == 1:
+            chosen = exact.iloc[0]
+        elif len(matches) == 1:
+            chosen = matches.iloc[0]
+        else:
+            chosen = None
+
+        if chosen is None:
+            st.warning("More than one player matches. Enter the full first and last name.")
+            st.caption("Matches: " + "; ".join(
+                f"{row.name} ({row.federation})" for row in matches.head(5).itertuples()
+            ))
+        else:
+            player_id = chosen["player_id"]
+            if hasattr(player_id, "item"):  # numpy number -> plain Python number for SQLite
+                player_id = player_id.item()
+
+            history = rating_history(player_id, str(rating_type))
+            if history.empty:
+                st.info("This player has no rated results for this rating type.")
+            else:
+                fig = px.line(
+                    history, x="year", y="rating", markers=True,
+                    title=f"{chosen['name']}: {rating_type} rating by year",
+                )
+                fig.update_xaxes(
+                    range=[HISTORY_START - 0.5, HISTORY_END + 0.5],
+                    dtick=1, tickformat="d", title="Year",
+                )
+                fig.update_yaxes(title="Rating")
+                st.plotly_chart(fig, key="player_history")
+
+# ---------------------------------------------------------------------------
+# COUNTRY AVERAGE RATING HISTORY
+# ---------------------------------------------------------------------------
+
+HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the chart
+
+
+@st.cache_data
+def country_rating_history(fide_code: str, rtype: str) -> pd.DataFrame:
+    """Get the average rating for one federation in each year."""
+    sql = f"""
+        SELECT CAST(year AS INTEGER) AS year,
+               ROUND(AVG(CAST(rating AS INTEGER)), 1) AS average_rating,
+               COUNT(*) AS number_of_players
+        FROM {SOURCE_TABLE}
+        WHERE federation = ?
+          AND CAST(rating_type AS TEXT) = ?
+          AND CAST(rating AS INTEGER) > 0
+        GROUP BY year
+        ORDER BY year
+    """
+    return _run_raw(sql, (fide_code, rtype))
+
+
+st.divider()
+st.header("Country average rating history")
+
+history = country_rating_history(fide_code, str(rating_type))
+
+if history.empty:
+    st.info("No rating history found for this country and rating type.")
+else:
+    fig = px.line(
+        history,
+        x="year",
+        y="average_rating",
+        markers=True,
+        title=f"{countries[fide_code]['name']}: Average {rating_type} Rating Over Time",
+        hover_data=["number_of_players"],
+            )
+
+    fig.update_xaxes(
+        range=[HISTORY_START - 0.5, HISTORY_END + 0.5],
+        dtick=1,
+        tickformat="d",
+        title="Year",
+    )
+    fig.update_yaxes(title="Average Rating")
+
+    st.plotly_chart(fig, key="country_history")

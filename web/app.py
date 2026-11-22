@@ -1,8 +1,158 @@
-import json
-import streamlit as st
-import plotly.graph_objects as go
+from __future__ import annotations
 
-# MAP PROCESSING:
+import json
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+st.set_page_config(page_title="Chess Title Players", layout="wide")
+
+# ---------------------------------------------------------------------------
+# PATHS / DATABASE SETUP
+# ---------------------------------------------------------------------------
+
+# Always find files next to this one, no matter where Streamlit is launched
+HERE = Path(__file__).parent
+DB_PATH = str(HERE / "chess_ratings.db")
+GEOJSON_PATH = str(HERE / "geoBoundaries-GBR-ADM1_simplified.geojson")
+SOURCE_TABLE = "chess_ratings"
+
+if not Path(DB_PATH).exists():
+    st.error(f"Database not found at {DB_PATH}")
+    st.stop()
+
+
+@st.cache_data
+def load_lists():
+    """Which (year, rating_type) lists exist in the table, with player counts."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return conn.execute(
+            f"SELECT year, rating_type, COUNT(*) FROM {SOURCE_TABLE} "
+            "GROUP BY year, rating_type ORDER BY year DESC, rating_type"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+lists = load_lists()
+if not lists:
+    st.error("The table is empty.")
+    st.stop()
+
+# Sidebar: choose which rating list to analyse
+years = list(dict.fromkeys(row[0] for row in lists))
+year = st.sidebar.selectbox("Rating list year", years)
+types = [row[1] for row in lists if row[0] == year]
+default_idx = next((i for i, t in enumerate(types) if "stand" in str(t).lower()), 0)
+rating_type = st.sidebar.selectbox("Rating type", types, index=default_idx)
+LIST_KEY = (str(year), str(rating_type))  # keeps Streamlit's cache correct per list
+
+
+def _lit(value) -> str:
+    """Escape a value for use inside a SQL string literal."""
+    return str(value).replace("'", "''")
+
+
+def make_ratings_view(conn: sqlite3.Connection) -> None:
+    """Create a temp view called 'ratings' using the column names the queries expect."""
+    conn.execute(f"""
+        CREATE TEMP VIEW ratings AS
+        SELECT player_id    AS "ID Number",
+               name         AS Name,
+               federation   AS Fed,
+               sex          AS Sex,
+               title        AS Tit,
+               women_title  AS WTit,
+               other_title  AS OTit,
+               foa          AS FOA,
+               rating       AS NOV22,
+               games        AS Gms,
+               k_factor     AS K,
+               birthday     AS "B-day",
+               flag         AS Flag
+        FROM {SOURCE_TABLE}
+        WHERE CAST(year AS TEXT) = '{_lit(LIST_KEY[0])}'
+          AND CAST(rating_type AS TEXT) = '{_lit(LIST_KEY[1])}'
+    """)
+
+
+# ---------------------------------------------------------------------------
+# COUNTRY QUERIES
+# FED_FILTER is swapped for "Fed IN (?, ?, ...)" so one country or several
+# can be passed in as a list.
+# ---------------------------------------------------------------------------
+
+COUNTRY_SUMMARY = """
+    SELECT COUNT(*) AS players,
+           SUM(CASE WHEN CAST(NOV22 AS INTEGER) > 0 THEN 1 ELSE 0 END) AS rated,
+           SUM(CASE WHEN Sex = 'F' THEN 1 ELSE 0 END) AS women,
+           SUM(CASE WHEN TRIM(Tit) = 'GM' THEN 1 ELSE 0 END) AS gms,
+           SUM(CASE WHEN TRIM(Tit) = 'GM' AND Sex = 'F' THEN 1 ELSE 0 END) AS women_gms,
+           ROUND(AVG(CASE WHEN CAST(NOV22 AS INTEGER) > 0
+                          THEN CAST(NOV22 AS INTEGER) END), 0) AS avg_rating
+    FROM ratings
+    WHERE FED_FILTER
+"""
+
+COUNTRY_TITLES = """
+    SELECT TRIM(Tit) AS title, Sex, COUNT(*) AS players
+    FROM ratings
+    WHERE FED_FILTER
+      AND Tit IS NOT NULL AND TRIM(Tit) <> ''
+    GROUP BY TRIM(Tit), Sex
+"""
+
+COUNTRY_TOP = """
+    SELECT Name, Sex, TRIM(Tit) AS Tit,
+           CAST(NOV22 AS INTEGER) AS rating,
+           2022 - CAST("B-day" AS INTEGER) AS age
+    FROM ratings
+    WHERE FED_FILTER
+      AND CAST(NOV22 AS INTEGER) > 0
+      EXTRA_FILTER
+    ORDER BY rating DESC
+    LIMIT 10
+"""
+
+
+@st.cache_data
+def _run_cached(sql: str, params: tuple, list_key: tuple) -> pd.DataFrame:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        make_ratings_view(conn)
+        return pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+
+
+def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
+    return _run_cached(sql, params, LIST_KEY)
+
+
+def country_query(template: str, feds: list[str], extra_filter: str = "") -> pd.DataFrame:
+    placeholders = ",".join("?" for _ in feds)
+    sql = template.replace("FED_FILTER", f"Fed IN ({placeholders})")
+    sql = sql.replace("EXTRA_FILTER", extra_filter)
+    return run_query(sql, tuple(feds))
+
+
+def get_fed_codes(fide_code: str) -> list[str]:
+    """Map the selected map/dropdown code to the FIDE federation codes to query.
+
+    England, Scotland and Wales are separate shapes on the map (each with its
+    own FIDE code), so every selection maps to exactly one federation.
+    """
+    return [fide_code]
+
+
+# ---------------------------------------------------------------------------
+# MAP PROCESSING
+# ---------------------------------------------------------------------------
 
 countries = {
     "AFG": {"name": "Afghanistan", "iso": "AFG"},
@@ -211,8 +361,8 @@ countries = {
     "ZIM": {"name": "Zimbabwe", "iso": "ZWE"},
 }
 
-GEOJSON_PATH = "geoBoundaries-GBR-ADM1_simplified.geojson"  # next to your app
 BASE_COLOR = "#9ecae1"
+FLAT_SCALE = [[0, BASE_COLOR], [1, BASE_COLOR]]
 
 # GeoJSON shapeName -> FIDE code (Northern Ireland has no FIDE federation)
 UK_NATIONS = [
@@ -255,7 +405,8 @@ def rewind_geojson(geojson):
 
 
 @st.cache_data
-def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value"):
+def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value",
+                 show_colorbar=True):
     """values: {FIDE code: number}. Countries missing from it are drawn gray."""
     values = values or {}
 
@@ -321,17 +472,15 @@ def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value"):
 
     fig.update_geos(projection_type="cylindrical stereographic", uirevision="keep")
     fig.update_layout(
-        coloraxis=dict(colorscale=colorscale, colorbar=dict(title=colorbar_title)),
+        coloraxis=dict(
+            colorscale=colorscale,
+            colorbar=dict(title=colorbar_title),
+            showscale=show_colorbar,
+        ),
         uirevision="keep",
         margin=dict(l=0, r=0, t=0, b=0),
     )
     return fig
-
-
-
-
-if "fide_code" not in st.session_state:
-    st.session_state.fide_code = "USA"
 
 
 def handle_map_click():
@@ -343,20 +492,85 @@ def handle_map_click():
             st.session_state.fide_code = clicked
 
 
-st.selectbox(
-    "Highlight a country",
-    options=sorted(countries, key=lambda c: countries[c]["name"]),
-    format_func=lambda code: countries[code]["name"],
-    key="fide_code",
-)
+# ---------------------------------------------------------------------------
+# PAGE
+# ---------------------------------------------------------------------------
+
+st.title("Chess Title Players")
+
+with st.sidebar.expander("Data check"):
+    st.caption(f"Using {year} / {rating_type} ratings")
+    st.dataframe(
+        run_query("SELECT Sex, COUNT(*) AS players FROM ratings GROUP BY Sex"),
+        hide_index=True,
+    )
+    st.dataframe(
+        run_query("SELECT TRIM(Tit) AS title, COUNT(*) AS players FROM ratings "
+                  "GROUP BY TRIM(Tit) ORDER BY players DESC"),
+        hide_index=True,
+    )
+
+# Flat base color for every country that can be clicked; pass real numbers here
+# instead (e.g. {"USA": 123, ...}) to turn the map into a heat map.
+flat_values = {c: 1 for c, i in countries.items() if i["iso"] is not None}
 
 st.plotly_chart(
-    build_figure(),
+    build_figure(
+        flat_values,
+        colorscale=FLAT_SCALE,
+        colorbar_title="Federation",
+        show_colorbar=False,
+    ),
     key="country_map",
     on_select=handle_map_click,
     selection_mode="points",
 )
 
+st.selectbox(
+    "Or pick from a list",
+    options=sorted(countries, key=lambda c: countries[c]["name"]),
+    format_func=lambda code: countries[code]["name"],
+    key="fide_code",
+)
+
 fide_code = st.session_state.fide_code
+feds = get_fed_codes(fide_code)
 st.subheader(countries[fide_code]["name"])
-# fide_code is ready for your database query here
+
+summary = country_query(COUNTRY_SUMMARY, feds).iloc[0]
+
+if summary["players"] == 0:
+    st.info("No players registered for this federation in the dataset.")
+else:
+    if summary["players"] < 50:
+        st.caption(
+            f"Only {int(summary['players'])} players here, so the numbers "
+            "below are small. Read them with care."
+        )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Players", f"{int(summary['players']):,}")
+    c2.metric("Grandmasters", int(summary["gms"]))
+    c3.metric(
+        "Avg rating",
+        "n/a" if pd.isna(summary["avg_rating"]) else int(summary["avg_rating"]),
+    )
+
+    titles = country_query(COUNTRY_TITLES, feds)
+    if not titles.empty:
+        st.plotly_chart(
+            px.bar(titles, x="title", y="players", color="Sex",
+                   barmode="group", title="Titled players by sex"),
+            key="chart_titles",
+        )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Top 10 overall**")
+        st.dataframe(country_query(COUNTRY_TOP, feds), hide_index=True)
+    with right:
+        st.markdown("**Top 10 women**")
+        st.dataframe(
+            country_query(COUNTRY_TOP, feds, extra_filter="AND Sex = 'F'"),
+            hide_index=True,
+        )

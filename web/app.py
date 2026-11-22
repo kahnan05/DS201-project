@@ -45,12 +45,27 @@ if not lists:
     st.stop()
 
 # Sidebar: choose which rating list to analyse
+ALL_YEARS = "All years"
 years = list(dict.fromkeys(row[0] for row in lists))
-year = st.sidebar.selectbox("Rating list year", years)
-types = [row[1] for row in lists if row[0] == year]
+# index=1 keeps the newest year as the default (index 0 is "All years")
+year = st.sidebar.selectbox("Rating list year", [ALL_YEARS] + years, index=1)
+if year == ALL_YEARS:
+    types = list(dict.fromkeys(row[1] for row in lists))
+else:
+    types = [row[1] for row in lists if row[0] == year]
 default_idx = next((i for i, t in enumerate(types) if "stand" in str(t).lower()), 0)
 rating_type = st.sidebar.selectbox("Rating type", types, index=default_idx)
-LIST_KEY = (str(year), str(rating_type))  # keeps Streamlit's cache correct per list
+if year == ALL_YEARS:
+    st.sidebar.caption(
+        "All years: each player is counted once, using their peak rating "
+        "across every year."
+    )
+
+# (year, rating type, title filter). The title filter is set further down,
+# once the sidebar Title Filter has been built; None means "All".
+LIST_KEY = (str(year), str(rating_type), None)
+
+NO_TITLE = "No title"
 
 
 def _lit(value) -> str:
@@ -58,8 +73,32 @@ def _lit(value) -> str:
     return str(value).replace("'", "''")
 
 
+def title_condition(selected, column: str = "title") -> str:
+    """SQL condition for the Title Filter. selected=None means All (no filtering)."""
+    if selected is None:
+        return "1 = 1"
+    parts = []
+    named = [t for t in selected if t != NO_TITLE]
+    if named:
+        quoted = ", ".join(f"'{_lit(t)}'" for t in named)
+        parts.append(f"TRIM({column}) IN ({quoted})")
+    if NO_TITLE in selected:
+        parts.append(f"({column} IS NULL OR TRIM({column}) = '')")
+    return "(" + " OR ".join(parts) + ")"
+
+
 def make_ratings_view(conn: sqlite3.Connection) -> None:
-    """Create a temp view called 'ratings' using the column names the queries expect."""
+    """Create a temp view called 'ratings' using the column names the queries expect.
+
+    One year selected: that year's list as-is.
+    All years: one row per player. SQLite takes the other columns (federation,
+    title, age...) from the row holding the player's peak rating, so every
+    count, mean and top-10 table counts each player once.
+    """
+    all_years = LIST_KEY[0] == ALL_YEARS
+    rating_expr = "MAX(CAST(rating AS INTEGER))" if all_years else "rating"
+    year_clause = "" if all_years else f"CAST(year AS TEXT) = '{_lit(LIST_KEY[0])}' AND "
+    group_clause = "GROUP BY player_id" if all_years else ""
     conn.execute(f"""
         CREATE TEMP VIEW ratings AS
         SELECT player_id    AS "ID Number",
@@ -70,14 +109,15 @@ def make_ratings_view(conn: sqlite3.Connection) -> None:
                women_title  AS WTit,
                other_title  AS OTit,
                foa          AS FOA,
-               rating       AS NOV22,
+               {rating_expr} AS NOV22,
                games        AS Gms,
                k_factor     AS K,
                birthday     AS "B-day",
                flag         AS Flag
         FROM {SOURCE_TABLE}
-        WHERE CAST(year AS TEXT) = '{_lit(LIST_KEY[0])}'
-          AND CAST(rating_type AS TEXT) = '{_lit(LIST_KEY[1])}'
+        WHERE {year_clause}CAST(rating_type AS TEXT) = '{_lit(LIST_KEY[1])}'
+          AND {title_condition(LIST_KEY[2])}
+        {group_clause}
     """)
 
 
@@ -165,6 +205,26 @@ MAP_METRICS = {
         FROM ratings
         GROUP BY TRIM(Fed)
     """,
+}
+
+RDYLGN = "RdYlGn"
+PINK_BLUE = [[0, "#ff8fc4"], [1, "#2b6cff"]]  # low % male = pink, high = blue
+
+MAP_COLORSCALES = {
+    "Mean rating": RDYLGN,
+    "Median rating": RDYLGN,
+    "Top rating": RDYLGN,
+    "Percent male": PINK_BLUE,
+    "Number of players": RDYLGN,
+}
+
+# Fixed (min, max) per metric. None = let Plotly choose from the data.
+MAP_RANGES = {
+    "Mean rating": (None, None),
+    "Median rating": (None, None),
+    "Top rating": (None, None),
+    "Percent male": (0, 100),
+    "Number of players": (None, None),
 }
 
 
@@ -409,10 +469,7 @@ countries = {
     "ZIM": {"name": "Zimbabwe", "iso": "ZWE"},
 }
 
-BASE_COLOR = "#9ecae1"
-FLAT_SCALE = [[0, BASE_COLOR], [1, BASE_COLOR]]
-
-# GeoJSON shapeName -> FIDE code 
+# GeoJSON shapeName -> FIDE code
 UK_NATIONS = [
     ("England", "ENG"),
     ("Scotland", "SCO"),
@@ -453,7 +510,7 @@ def rewind_geojson(geojson):
 
 @st.cache_data
 def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value",
-                 show_colorbar=True):
+                 show_colorbar=True, zmin=None, zmax=None):
     """values: {FIDE code: number}. Countries missing from it are drawn gray."""
     values = values or {}
 
@@ -523,6 +580,8 @@ def build_figure(values=None, colorscale="YlOrRd", colorbar_title="Value",
             colorscale=colorscale,
             colorbar=dict(title=colorbar_title),
             showscale=show_colorbar,
+            cmin=zmin,  # None = auto range
+            cmax=zmax,
         ),
         uirevision="keep",
         margin=dict(l=0, r=0, t=0, b=0),
@@ -544,29 +603,73 @@ def handle_map_click():
 
 st.title("Chess Title Players")
 
-
 # Sidebar selector that only affects the heat map
 map_metric = st.sidebar.selectbox("Map shows", list(MAP_METRICS))
+
+
+# ---- Title Filter (sidebar): filters the map and every chart/table ----
+@st.cache_data
+def load_titles() -> list[str]:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            f"SELECT DISTINCT TRIM(title) FROM {SOURCE_TABLE} "
+            "WHERE title IS NOT NULL AND TRIM(title) <> ''"
+        ).fetchall()
+    finally:
+        conn.close()
+    found = {r[0] for r in rows}
+    preferred = [t for t in ("GM", "IM", "FM", "CM") if t in found]
+    return preferred + sorted(found - set(preferred)) + [NO_TITLE]
+
+
+TITLE_OPTIONS = load_titles()
+
+st.session_state.setdefault("title_all", True)
+for t in TITLE_OPTIONS:
+    st.session_state.setdefault(f"title_{t}", False)
+
+
+def _on_all_change():
+    if st.session_state.title_all:
+        for t in TITLE_OPTIONS:  # checking All clears the individual titles
+            st.session_state[f"title_{t}"] = False
+    else:
+        st.session_state.title_all = True  # All can't be unchecked by itself
+
+
+def _on_title_change():
+    # Any title checked -> All off. No titles checked -> back to All.
+    st.session_state.title_all = not any(
+        st.session_state[f"title_{t}"] for t in TITLE_OPTIONS
+    )
+
+
+with st.sidebar.expander("Title Filter", expanded=True):
+    st.checkbox("All", key="title_all", on_change=_on_all_change)
+    for t in TITLE_OPTIONS:
+        st.checkbox(t, key=f"title_{t}", on_change=_on_title_change)
+
+if st.session_state.title_all:
+    TITLE_FILTER = None  # None = no filtering
+else:
+    TITLE_FILTER = tuple(t for t in TITLE_OPTIONS if st.session_state[f"title_{t}"])
+
+# Include the filter in the cache key so results refresh when it changes
+LIST_KEY = (str(year), str(rating_type), TITLE_FILTER)
 
 map_df = run_query(MAP_METRICS[map_metric])
 map_values = dict(zip(map_df["fed"], map_df["value"]))
 
-RDYLGN = "RdYlGn"
-PINK_BLUE = [[0, "#ff8fc4"], [1, "#2b6cff"]]  # low % male = pink, high = blue
-
-MAP_COLORSCALES = {
-    "Mean rating": RDYLGN,
-    "Median rating": RDYLGN,
-    "Top rating": RDYLGN,
-    "Percent male": PINK_BLUE,
-    "Number of players": RDYLGN,
-}
+zmin, zmax = MAP_RANGES[map_metric]
 
 st.plotly_chart(
     build_figure(
         map_values,
         colorscale=MAP_COLORSCALES[map_metric],
         colorbar_title=map_metric,
+        zmin=zmin,
+        zmax=zmax,
     ),
     key="country_map",
     on_select=handle_map_click,
@@ -626,7 +729,7 @@ else:
 # PLAYER RATING HISTORY
 # ---------------------------------------------------------------------------
 
-HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the chart
+HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the charts
 
 
 @st.cache_data
@@ -653,13 +756,14 @@ def search_players(text: str, rtype: str) -> pd.DataFrame:
     return _run_raw(sql, (rtype, *[f"%{t}%" for t in terms]))
 
 
-def rating_history(player_id, rtype: str) -> pd.DataFrame:
+def rating_history(player_id, rtype: str, title_filter) -> pd.DataFrame:
     sql = f"""
         SELECT CAST(year AS INTEGER) AS year,
                MAX(CAST(rating AS INTEGER)) AS rating
         FROM {SOURCE_TABLE}
         WHERE player_id = ? AND CAST(rating_type AS TEXT) = ?
           AND CAST(rating AS INTEGER) > 0
+          AND {title_condition(title_filter)}
         GROUP BY year
         ORDER BY year
     """
@@ -703,12 +807,15 @@ else:
             if hasattr(player_id, "item"):  # numpy number -> plain Python number for SQLite
                 player_id = player_id.item()
 
-            history = rating_history(player_id, str(rating_type))
-            if history.empty:
-                st.info("This player has no rated results for this rating type.")
+            player_hist = rating_history(player_id, str(rating_type), TITLE_FILTER)
+            if player_hist.empty:
+                st.info(
+                    "This player has no rated results for this rating type "
+                    "(and the selected titles)."
+                )
             else:
                 fig = px.line(
-                    history, x="year", y="rating", markers=True,
+                    player_hist, x="year", y="rating", markers=True,
                     title=f"{chosen['name']}: {rating_type} rating by year",
                 )
                 fig.update_xaxes(
@@ -722,11 +829,9 @@ else:
 # COUNTRY AVERAGE RATING HISTORY
 # ---------------------------------------------------------------------------
 
-HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the chart
-
 
 @st.cache_data
-def country_rating_history(fide_code: str, rtype: str) -> pd.DataFrame:
+def country_rating_history(fide_code: str, rtype: str, title_filter) -> pd.DataFrame:
     """Get the average rating for one federation in each year."""
     sql = f"""
         SELECT CAST(year AS INTEGER) AS year,
@@ -736,6 +841,7 @@ def country_rating_history(fide_code: str, rtype: str) -> pd.DataFrame:
         WHERE federation = ?
           AND CAST(rating_type AS TEXT) = ?
           AND CAST(rating AS INTEGER) > 0
+          AND {title_condition(title_filter)}
         GROUP BY year
         ORDER BY year
     """
@@ -745,19 +851,19 @@ def country_rating_history(fide_code: str, rtype: str) -> pd.DataFrame:
 st.divider()
 st.header("Country average rating history")
 
-history = country_rating_history(fide_code, str(rating_type))
+country_hist = country_rating_history(fide_code, str(rating_type), TITLE_FILTER)
 
-if history.empty:
-    st.info("No rating history found for this country and rating type.")
+if country_hist.empty:
+    st.info("No rating history found for this country, rating type and title selection.")
 else:
     fig = px.line(
-        history,
+        country_hist,
         x="year",
         y="average_rating",
         markers=True,
         title=f"{countries[fide_code]['name']}: Average {rating_type} Rating Over Time",
         hover_data=["number_of_players"],
-            )
+    )
 
     fig.update_xaxes(
         range=[HISTORY_START - 0.5, HISTORY_END + 0.5],

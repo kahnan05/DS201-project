@@ -551,10 +551,21 @@ map_metric = st.sidebar.selectbox("Map shows", list(MAP_METRICS))
 map_df = run_query(MAP_METRICS[map_metric])
 map_values = dict(zip(map_df["fed"], map_df["value"]))
 
+RDYLGN = "RdYlGn"
+PINK_BLUE = [[0, "#ff8fc4"], [1, "#2b6cff"]]  # low % male = pink, high = blue
+
+MAP_COLORSCALES = {
+    "Mean rating": RDYLGN,
+    "Median rating": RDYLGN,
+    "Top rating": RDYLGN,
+    "Percent male": PINK_BLUE,
+    "Number of players": RDYLGN,
+}
+
 st.plotly_chart(
     build_figure(
         map_values,
-        colorscale="YlOrRd",
+        colorscale=MAP_COLORSCALES[map_metric],
         colorbar_title=map_metric,
     ),
     key="country_map",

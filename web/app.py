@@ -621,3 +621,150 @@ else:
             country_query(COUNTRY_TOP, feds, extra_filter="AND Sex = 'F'"),
             hide_index=True,
         )
+
+# ---------------------------------------------------------------------------
+# PLAYER RATING HISTORY
+# ---------------------------------------------------------------------------
+
+HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the chart
+
+
+@st.cache_data
+def _run_raw(sql: str, params: tuple = ()) -> pd.DataFrame:
+    """Query the real table directly (the 'ratings' view only holds one year)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+
+
+def search_players(text: str, rtype: str) -> pd.DataFrame:
+    terms = text.split()
+    where = " AND ".join("name LIKE ?" for _ in terms)
+    sql = f"""
+        SELECT player_id, name, federation, MAX(year) AS last_year
+        FROM {SOURCE_TABLE}
+        WHERE CAST(rating_type AS TEXT) = ? AND {where}
+        GROUP BY player_id
+        ORDER BY last_year DESC, name
+        LIMIT 25
+    """
+    return _run_raw(sql, (rtype, *[f"%{t}%" for t in terms]))
+
+
+def rating_history(player_id, rtype: str) -> pd.DataFrame:
+    sql = f"""
+        SELECT CAST(year AS INTEGER) AS year,
+               MAX(CAST(rating AS INTEGER)) AS rating
+        FROM {SOURCE_TABLE}
+        WHERE player_id = ? AND CAST(rating_type AS TEXT) = ?
+          AND CAST(rating AS INTEGER) > 0
+        GROUP BY year
+        ORDER BY year
+    """
+    return _run_raw(sql, (player_id, rtype))
+
+
+st.divider()
+st.header("Player rating history")
+
+search_text = st.text_input("Search for a player")
+
+words = search_text.split()
+if len(words) < 2:
+    st.info("Enter a player's first and last name.")
+else:
+    matches = search_players(search_text.strip(), str(rating_type))
+
+    if matches.empty:
+        st.warning("No players found with that name.")
+    else:
+        # Prefer an exact name match (same words, any order, commas ignored)
+        wanted = sorted(w.lower().strip(",") for w in words)
+        exact = matches[matches["name"].apply(
+            lambda n: sorted(str(n).lower().replace(",", " ").split()) == wanted
+        )]
+
+        if len(exact) == 1:
+            chosen = exact.iloc[0]
+        elif len(matches) == 1:
+            chosen = matches.iloc[0]
+        else:
+            chosen = None
+
+        if chosen is None:
+            st.warning("More than one player matches. Enter the full first and last name.")
+            st.caption("Matches: " + "; ".join(
+                f"{row.name} ({row.federation})" for row in matches.head(5).itertuples()
+            ))
+        else:
+            player_id = chosen["player_id"]
+            if hasattr(player_id, "item"):  # numpy number -> plain Python number for SQLite
+                player_id = player_id.item()
+
+            history = rating_history(player_id, str(rating_type))
+            if history.empty:
+                st.info("This player has no rated results for this rating type.")
+            else:
+                fig = px.line(
+                    history, x="year", y="rating", markers=True,
+                    title=f"{chosen['name']}: {rating_type} rating by year",
+                )
+                fig.update_xaxes(
+                    range=[HISTORY_START - 0.5, HISTORY_END + 0.5],
+                    dtick=1, tickformat="d", title="Year",
+                )
+                fig.update_yaxes(title="Rating")
+                st.plotly_chart(fig, key="player_history")
+
+# ---------------------------------------------------------------------------
+# COUNTRY AVERAGE RATING HISTORY
+# ---------------------------------------------------------------------------
+
+HISTORY_START, HISTORY_END = 2016, 2026  # fixed x-axis range for the chart
+
+
+@st.cache_data
+def country_rating_history(fide_code: str, rtype: str) -> pd.DataFrame:
+    """Get the average rating for one federation in each year."""
+    sql = f"""
+        SELECT CAST(year AS INTEGER) AS year,
+               ROUND(AVG(CAST(rating AS INTEGER)), 1) AS average_rating,
+               COUNT(*) AS number_of_players
+        FROM {SOURCE_TABLE}
+        WHERE federation = ?
+          AND CAST(rating_type AS TEXT) = ?
+          AND CAST(rating AS INTEGER) > 0
+        GROUP BY year
+        ORDER BY year
+    """
+    return _run_raw(sql, (fide_code, rtype))
+
+
+st.divider()
+st.header("Country average rating history")
+
+history = country_rating_history(fide_code, str(rating_type))
+
+if history.empty:
+    st.info("No rating history found for this country and rating type.")
+else:
+    fig = px.line(
+        history,
+        x="year",
+        y="average_rating",
+        markers=True,
+        title=f"{countries[fide_code]['name']}: Average {rating_type} Rating Over Time",
+        hover_data=["number_of_players"],
+            )
+
+    fig.update_xaxes(
+        range=[HISTORY_START - 0.5, HISTORY_END + 0.5],
+        dtick=1,
+        tickformat="d",
+        title="Year",
+    )
+    fig.update_yaxes(title="Average Rating")
+
+    st.plotly_chart(fig, key="country_history")

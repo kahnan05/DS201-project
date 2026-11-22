@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+"""
+MAP PROCESSING:
+"""
+
 countries = {
     "AFG": {"name": "Afghanistan", "iso": "AFG"},
     "AHO": {"name": "Netherlands Antilles", "iso": None},  # dissolved 2010
@@ -208,30 +212,64 @@ countries = {
     "ZAM": {"name": "Zambia", "iso": "ZMB"},
     "ZIM": {"name": "Zimbabwe", "iso": "ZWE"},
 }
+if "fide_code" not in st.session_state:
+    st.session_state.fide_code = "USA"
 
-# The selectbox holds FIDE codes as its values but displays country names
-fide_code = st.selectbox(
-    "Highlight a country",
+@st.cache_data
+def build_figure():
+    rows, seen_iso = [], set()
+    for code, info in countries.items():
+        iso = info["iso"]
+        if iso is None or iso in seen_iso:
+            continue
+        seen_iso.add(iso)
+        rows.append({
+            "fide": code,
+            "iso": iso,
+            "name": "United Kingdom" if iso == "GBR" else info["name"],
+            "value": 1,
+        })
+    df = pd.DataFrame(rows)
+
+    fig = px.choropleth(
+        df,
+        locations="iso",
+        color="value",
+        hover_name="name",
+        custom_data=["fide"],
+        color_continuous_scale=["#9ecae1", "#9ecae1"],  # flat base color
+        projection="cylindrical stereographic",
+    )
+    fig.update_layout(coloraxis_showscale=False, uirevision="keep")
+    fig.update_geos(uirevision="keep")
+    # Plotly highlights the clicked country itself: the selected one stays
+    # at full strength and its own color, everything else fades
+    fig.update_traces(
+        selected=dict(marker=dict(opacity=1)),
+        unselected=dict(marker=dict(opacity=0.35)),
+    )
+    return fig
+
+event = st.plotly_chart(
+    build_figure(),
+    key="country_map",
+    on_select="rerun",
+    selection_mode="points",
+)
+
+# No st.rerun() needed: on_select="rerun" already reran the script
+points = event.selection["points"]
+if points:
+    st.session_state.fide_code = points[0]["customdata"][0]
+
+st.selectbox(
+    "Or pick from a list",
     options=sorted(countries, key=lambda c: countries[c]["name"]),
     format_func=lambda code: countries[code]["name"],
+    key="fide_code",
 )
 
-selected = countries[fide_code]
+fide_code = st.session_state.fide_code
+st.subheader(countries[fide_code]["name"])
+# fide_code is ready for your database query here
 
-df = pd.DataFrame({
-    "fide": [fide_code],
-    "iso": [selected["iso"]],
-    "name": [selected["name"]],
-    "value": [1],
-})
-
-fig = px.choropleth(
-    df,
-    locations="iso",          # ISO-3 is the default locationmode
-    color="value",
-    hover_name="name",
-    projection="cylindrical stereographic",
-)
-fig.update_layout(coloraxis_showscale=False)
-
-st.plotly_chart(fig)

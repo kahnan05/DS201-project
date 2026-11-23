@@ -150,7 +150,7 @@ COUNTRY_TITLES = """
 COUNTRY_TOP = """
     SELECT Name, Sex, TRIM(Tit) AS Tit,
            CAST(NOV22 AS INTEGER) AS rating,
-           2022 - CAST("B-day" AS INTEGER) AS age
+           2026 - CAST("B-day" AS INTEGER) AS age
     FROM ratings
     WHERE FED_FILTER
       AND CAST(NOV22 AS INTEGER) > 0

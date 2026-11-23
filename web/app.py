@@ -618,9 +618,9 @@ def load_titles() -> list[str]:
         ).fetchall()
     finally:
         conn.close()
-    found = {r[0] for r in rows}
+    found = {r[0] for r in rows} - {"WH"}  # WH is not offered as a filter option
     preferred = [t for t in ("GM", "IM", "FM", "CM") if t in found]
-    return preferred + sorted(found - set(preferred)) + [NO_TITLE]
+    return preferred + sorted(found - set(preferred))
 
 
 TITLE_OPTIONS = load_titles()
